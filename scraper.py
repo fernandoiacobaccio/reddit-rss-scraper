@@ -6,6 +6,7 @@ new ones to a Google Sheet. No Reddit API key required.
 
 Features:
   - Deduplication by URL
+  - Media detection: Image / GIF / Video / Redgif / Gallery / Text / Link / Comment
   - Repost detection: title fuzzy match + perceptual image hash
   - Unique subreddit tracking in a separate spreadsheet
   - Header row with freeze on first run
@@ -16,8 +17,9 @@ Run manually or schedule with Task Scheduler (Windows) / cron (Mac).
 import io
 import re
 import sys
+import time
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 import xml.etree.ElementTree as ET
@@ -51,6 +53,8 @@ GOOGLE_CREDENTIALS_FILE   = "google_credentials.json"
 TITLE_SIMILARITY_THRESHOLD = 85   # 0–100; scores above this flag a potential repost
 IMAGE_HASH_THRESHOLD       = 10   # hamming distance; values below this flag a potential repost
 
+REDDIT_API_DELAY           = 0.6  # seconds between Reddit JSON API calls (rate limit courtesy)
+
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -72,26 +76,32 @@ SCOPES = [
 
 # Column order — do not reorder without updating index constants below
 HEADER = [
-    "URL",            # 0
-    "Title",          # 1
-    "Subreddit",      # 2
-    "Type",           # 3
-    "Date Fetched",   # 4
-    "Status",         # 5
-    "Comment",        # 6
-    "Image Hash",     # 7
+    "URL",               # 0
+    "Title",             # 1
+    "Subreddit",         # 2
+    "Type",              # 3
+    "Date Fetched",      # 4
+    "Status",            # 5
+    "Comment",           # 6
+    "Image Hash",        # 7
     "Potential Repost",  # 8
+    "Media Type",        # 9
+    "Media URL",         # 10
 ]
 
-COL_URL       = 0
-COL_TITLE     = 1
-COL_HASH      = 7
-COL_REPOST    = 8
+COL_URL        = 0
+COL_TITLE      = 1
+COL_HASH       = 7
+COL_REPOST     = 8
+COL_MEDIA_TYPE = 9
+COL_MEDIA_URL  = 10
 
 NS = {
     "atom":  "http://www.w3.org/2005/Atom",
     "media": "http://search.yahoo.com/mrss/",
 }
+
+REDDIT_HEADERS = {"User-Agent": "reddit-saved-rss-reader/1.0"}
 
 # ─── GOOGLE SHEETS ────────────────────────────────────────────────────────────
 
@@ -148,7 +158,7 @@ def ensure_header(worksheet):
         return [], []
 
     if rows[0] != HEADER:
-        worksheet.update("A1", [HEADER])
+        worksheet.update([HEADER], "A1")
         worksheet.freeze(rows=1)
         log.info("Header row updated and frozen.")
 
@@ -162,7 +172,6 @@ def get_existing_subreddits(sub_worksheet):
     if sub_worksheet is None:
         return set()
     values = sub_worksheet.get_all_values()
-    # Skip header row if present
     data = values[1:] if values and values[0] and values[0][0].lower() == "subreddit" else values
     return {row[0].strip().lower() for row in data if row and row[0].strip()}
 
@@ -172,7 +181,6 @@ def update_subreddits(sub_worksheet, existing_subreddits, new_subreddits):
     if sub_worksheet is None:
         return
 
-    # Write header if sheet is empty
     current = sub_worksheet.get_all_values()
     if not current:
         sub_worksheet.append_row(["Subreddit", "First Seen"], value_input_option="RAW")
@@ -180,9 +188,103 @@ def update_subreddits(sub_worksheet, existing_subreddits, new_subreddits):
 
     to_add = sorted(s for s in new_subreddits if s and s.lower() not in existing_subreddits)
     if to_add:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         sub_worksheet.append_rows([[s, today] for s in to_add], value_input_option="RAW")
         log.info(f"Tracked {len(to_add)} new subreddit(s): {', '.join(to_add)}")
+
+# ─── MEDIA DETECTION ──────────────────────────────────────────────────────────
+
+def fetch_post_media(post_url, kind):
+    """
+    Fetch Reddit's JSON API for a post and detect the media type + direct URL.
+
+    Returns (media_type, media_url, thumbnail_url) where media_type is one of:
+      Image | GIF | Video | Redgif | Gallery | Text | Link | Comment | Unknown
+    """
+    if kind == "Comment":
+        return "Comment", "", ""
+
+    json_url = post_url.rstrip("/") + ".json"
+    try:
+        resp = requests.get(json_url, headers=REDDIT_HEADERS, timeout=15)
+        resp.raise_for_status()
+        data      = resp.json()
+        post_data = data[0]["data"]["children"][0]["data"]
+    except Exception as e:
+        log.debug(f"Could not fetch post metadata for {post_url}: {e}")
+        return "Unknown", "", ""
+
+    asset_url  = post_data.get("url", "")
+    post_hint  = post_data.get("post_hint", "")
+    is_video   = post_data.get("is_video", False)
+    is_self    = post_data.get("is_self", False)
+    media      = post_data.get("media") or {}
+
+    # ── Thumbnail: prefer highest-res preview image ──
+    thumbnail_url = ""
+    preview = post_data.get("preview") or {}
+    images  = preview.get("images", [])
+    if images:
+        resolutions = images[0].get("resolutions", [])
+        source      = images[0].get("source", {})
+        best        = resolutions[-1] if resolutions else source
+        thumbnail_url = best.get("url", "").replace("&amp;", "&")
+
+    if not thumbnail_url:
+        raw_thumb = post_data.get("thumbnail", "")
+        if raw_thumb not in ("self", "default", "nsfw", "spoiler", "image", ""):
+            thumbnail_url = raw_thumb
+
+    # ── Redgifs ──
+    if "redgifs.com" in asset_url or "redgifs.com" in str(media).lower():
+        return "Redgif", asset_url, thumbnail_url
+
+    # ── Reddit-hosted video ──
+    if is_video or post_hint == "hosted:video":
+        reddit_video = media.get("reddit_video", {})
+        video_url    = reddit_video.get("fallback_url", asset_url)
+        return "Video", video_url, thumbnail_url
+
+    # ── External rich video (YouTube, Streamable, etc.) ──
+    if post_hint == "rich:video":
+        oembed   = media.get("oembed", {})
+        provider = oembed.get("provider_name", "").lower()
+        if "redgifs" in provider or "redgifs" in asset_url:
+            return "Redgif", asset_url, thumbnail_url
+        return "Video", asset_url, thumbnail_url
+
+    # ── v.redd.it direct video links ──
+    if "v.redd.it" in asset_url:
+        return "Video", asset_url, thumbnail_url
+
+    # ── Reddit gallery ──
+    if post_hint == "gallery" or post_data.get("is_gallery"):
+        return "Gallery", asset_url, thumbnail_url
+
+    # ── Image ──
+    if post_hint == "image":
+        lower = asset_url.lower()
+        if lower.endswith(".gif") or "giphy.com" in lower:
+            return "GIF", asset_url, thumbnail_url
+        return "Image", asset_url, thumbnail_url
+
+    # ── URL-extension fallback ──
+    lower = asset_url.lower().split("?")[0]
+    if lower.endswith((".jpg", ".jpeg", ".png", ".webp")):
+        return "Image", asset_url, thumbnail_url
+    if lower.endswith(".gif"):
+        return "GIF", asset_url, thumbnail_url
+    if lower.endswith((".gifv", ".mp4", ".webm")):
+        return "Video", asset_url, thumbnail_url
+    if "i.redd.it" in asset_url or "i.imgur.com" in asset_url:
+        return "Image", asset_url, thumbnail_url
+
+    # ── Text / self post ──
+    if is_self or post_hint == "self":
+        return "Text", "", thumbnail_url
+
+    # ── Anything else is an external link ──
+    return "Link", asset_url, thumbnail_url
 
 # ─── IMAGE HASHING ────────────────────────────────────────────────────────────
 
@@ -191,11 +293,7 @@ def fetch_image_hash(thumbnail_url):
     if not IMAGE_HASH_AVAILABLE or not thumbnail_url:
         return ""
     try:
-        resp = requests.get(
-            thumbnail_url,
-            timeout=10,
-            headers={"User-Agent": "reddit-saved-rss-reader/1.0"},
-        )
+        resp = requests.get(thumbnail_url, timeout=10, headers=REDDIT_HEADERS)
         resp.raise_for_status()
         img = Image.open(io.BytesIO(resp.content)).convert("RGB")
         return str(imagehash.phash(img))
@@ -208,7 +306,7 @@ def fetch_image_hash(thumbnail_url):
 def find_repost(title, img_hash, existing_rows):
     """
     Check title similarity and image hash against all existing rows.
-    Returns the URL of the suspected original post, or '' if no match.
+    Returns the URL of the suspected original post, or ''.
     A match requires EITHER a close-enough title OR a close-enough image hash.
     """
     for row in existing_rows:
@@ -219,18 +317,13 @@ def find_repost(title, img_hash, existing_rows):
         existing_title = row[COL_TITLE] if len(row) > COL_TITLE else ""
         existing_hash  = row[COL_HASH]  if len(row) > COL_HASH  else ""
 
-        # ── Title similarity ──
         if FUZZY_AVAILABLE and title and existing_title:
-            score = fuzz.token_sort_ratio(title.lower(), existing_title.lower())
-            if score >= TITLE_SIMILARITY_THRESHOLD:
+            if fuzz.token_sort_ratio(title.lower(), existing_title.lower()) >= TITLE_SIMILARITY_THRESHOLD:
                 return existing_url
 
-        # ── Image hash similarity ──
         if IMAGE_HASH_AVAILABLE and img_hash and existing_hash:
             try:
-                h1 = imagehash.hex_to_hash(img_hash)
-                h2 = imagehash.hex_to_hash(existing_hash)
-                if (h1 - h2) <= IMAGE_HASH_THRESHOLD:
+                if (imagehash.hex_to_hash(img_hash) - imagehash.hex_to_hash(existing_hash)) <= IMAGE_HASH_THRESHOLD:
                     return existing_url
             except Exception:
                 pass
@@ -240,9 +333,8 @@ def find_repost(title, img_hash, existing_rows):
 # ─── RSS PARSING ──────────────────────────────────────────────────────────────
 
 def fetch_rss(url):
-    headers = {"User-Agent": "reddit-saved-rss-reader/1.0"}
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=REDDIT_HEADERS, timeout=15)
         resp.raise_for_status()
     except requests.RequestException as e:
         log.error(f"Failed to fetch RSS feed: {e}")
@@ -254,7 +346,6 @@ def fetch_rss(url):
 
     items = []
     for entry in entries:
-        # ── URL ──
         link_el = entry.find("atom:link[@rel='alternate']", NS)
         if link_el is None:
             link_el = entry.find("atom:link", NS)
@@ -266,7 +357,6 @@ def fetch_rss(url):
 
         title = (entry.findtext("atom:title", default="", namespaces=NS) or "").strip()
 
-        # ── Subreddit ──
         cat       = entry.find("atom:category", NS)
         subreddit = ""
         if cat is not None:
@@ -274,26 +364,9 @@ def fetch_rss(url):
             subreddit = label.lstrip("r/") if label else cat.attrib.get("term", "")
 
         kind         = "Comment" if "/comment/" in url_val else "Post"
-        date_fetched = datetime.utcnow().strftime("%Y-%m-%d")
+        date_fetched = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-        # ── Thumbnail URL (for image hashing) ──
-        thumbnail_url = ""
-
-        # Try <media:thumbnail url="...">
-        thumb_el = entry.find("media:thumbnail", NS)
-        if thumb_el is not None:
-            thumbnail_url = thumb_el.attrib.get("url", "")
-
-        # Fallback: parse <img src="..."> from entry content
-        if not thumbnail_url:
-            content_el = entry.find("atom:content", NS)
-            if content_el is not None:
-                content_text = content_el.text or ""
-                img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', content_text)
-                if img_match:
-                    thumbnail_url = img_match.group(1)
-
-        items.append((url_val, title, subreddit, kind, date_fetched, thumbnail_url))
+        items.append((url_val, title, subreddit, kind, date_fetched))
 
     return items
 
@@ -301,20 +374,30 @@ def fetch_rss(url):
 
 def append_new(worksheet, existing_urls, existing_rows, items):
     existing_set = set(existing_urls)
-    all_rows     = list(existing_rows)   # grows as we add rows this run
+    all_rows     = list(existing_rows)
     new_rows     = []
 
-    for url_val, title, subreddit, kind, date_fetched, thumbnail_url in items:
+    for url_val, title, subreddit, kind, date_fetched in items:
         if url_val in existing_set:
             continue
+
+        # Fetch media info from Reddit JSON API
+        media_type, media_url, thumbnail_url = fetch_post_media(url_val, kind)
+        log.info(f"  [{media_type}] {title[:60]}")
+        time.sleep(REDDIT_API_DELAY)
 
         img_hash  = fetch_image_hash(thumbnail_url)
         repost_of = find_repost(title, img_hash, all_rows)
 
         if repost_of:
-            log.info(f"Potential repost: '{title[:60]}' → {repost_of}")
+            log.info(f"  Potential repost detected → {repost_of}")
 
-        row = [url_val, title, subreddit, kind, date_fetched, "Pending", "", img_hash, repost_of]
+        row = [
+            url_val, title, subreddit, kind, date_fetched,
+            "Pending", "",
+            img_hash, repost_of,
+            media_type, media_url,
+        ]
         new_rows.append(row)
         existing_set.add(url_val)
         all_rows.append(row)
@@ -337,13 +420,12 @@ def main():
     if not IMAGE_HASH_AVAILABLE:
         log.warning("Pillow/imagehash not installed — image hash detection disabled.")
 
-    worksheet, sub_worksheet       = connect_sheets()
-    existing_urls, existing_rows   = ensure_header(worksheet)
+    worksheet, sub_worksheet     = connect_sheets()
+    existing_urls, existing_rows = ensure_header(worksheet)
     log.info(f"Sheet currently has {len(existing_urls)} entries.")
 
     items = fetch_rss(RSS_URL)
 
-    # ── Subreddit tracking ──
     existing_subs = get_existing_subreddits(sub_worksheet)
     new_subs      = {item[2] for item in items if item[2]}
     update_subreddits(sub_worksheet, existing_subs, new_subs)
