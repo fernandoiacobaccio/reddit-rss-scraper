@@ -390,7 +390,7 @@ def append_new(worksheet, existing_urls, existing_rows, items):
         repost_of = find_repost(title, img_hash, all_rows)
 
         if repost_of:
-            log.info(f"  Potential repost detected → {repost_of}")
+            log.info(f"  Potential repost detected -> {repost_of}")
 
         row = [
             url_val, title, subreddit, kind, date_fetched,
