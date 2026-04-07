@@ -4,27 +4,54 @@ Reddit Saved Posts (RSS) → Google Sheets
 Fetches saved posts from a Reddit private RSS feed and appends
 new ones to a Google Sheet. No Reddit API key required.
 
-Run manually or schedule with Task Scheduler (Windows) / launchd (Mac).
+Features:
+  - Deduplication by URL
+  - Repost detection: title fuzzy match + perceptual image hash
+  - Unique subreddit tracking in a separate spreadsheet
+  - Header row with freeze on first run
+
+Run manually or schedule with Task Scheduler (Windows) / cron (Mac).
 """
+
+import io
+import re
+import sys
+import logging
+from datetime import datetime
 
 import requests
 import xml.etree.ElementTree as ET
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
-import logging
-import sys
 
-# ─── CONFIG — edit these three lines, nothing else ───────────────────────────
+try:
+    from thefuzz import fuzz
+    FUZZY_AVAILABLE = True
+except ImportError:
+    FUZZY_AVAILABLE = False
+
+try:
+    from PIL import Image
+    import imagehash
+    IMAGE_HASH_AVAILABLE = True
+except ImportError:
+    IMAGE_HASH_AVAILABLE = False
+
+# ─── CONFIG — edit these lines, nothing else ──────────────────────────────────
 
 RSS_URL = "https://www.reddit.com/user/DirectionEuphoric275/saved.rss?feed=7d202c884b326cb4ef634954444288b694b6b0bd&user=DirectionEuphoric275"
 
-SPREADSHEET_NAME = "Reddit Saved Assets"   # exact name of your Google Sheet
-WORKSHEET_NAME   = "Assets"                # tab name inside the sheet
+SPREADSHEET_NAME          = "Reddit Saved Assets"   # main sheet name
+WORKSHEET_NAME            = "Assets"                # tab inside main sheet
+SUBREDDITS_SPREADSHEET_ID = "1NhwHFOeW18xRU2KD5tWkpr1kSJ0x1SssHRU9hgmhsD8"
+SUBREDDITS_WORKSHEET_NAME = "Sheet1"                # tab inside subreddits sheet
 
-GOOGLE_CREDENTIALS_FILE = "google_credentials.json"  # keep in same folder as this script
+GOOGLE_CREDENTIALS_FILE   = "google_credentials.json"
 
-# ─── LOGGING ─────────────────────────────────────────────────────────────────
+TITLE_SIMILARITY_THRESHOLD = 85   # 0–100; scores above this flag a potential repost
+IMAGE_HASH_THRESHOLD       = 10   # hamming distance; values below this flag a potential repost
+
+# ─── LOGGING ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,16 +70,37 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-HEADER = ["URL", "Title", "Subreddit", "Type", "Date Fetched", "Status", "Comment"]
+# Column order — do not reorder without updating index constants below
+HEADER = [
+    "URL",            # 0
+    "Title",          # 1
+    "Subreddit",      # 2
+    "Type",           # 3
+    "Date Fetched",   # 4
+    "Status",         # 5
+    "Comment",        # 6
+    "Image Hash",     # 7
+    "Potential Repost",  # 8
+]
 
-# Reddit Atom feed namespace
-NS = {"atom": "http://www.w3.org/2005/Atom"}
+COL_URL       = 0
+COL_TITLE     = 1
+COL_HASH      = 7
+COL_REPOST    = 8
+
+NS = {
+    "atom":  "http://www.w3.org/2005/Atom",
+    "media": "http://search.yahoo.com/mrss/",
+}
 
 # ─── GOOGLE SHEETS ────────────────────────────────────────────────────────────
 
 def connect_sheets():
+    """Connect to both spreadsheets. Returns (assets_worksheet, subreddits_worksheet)."""
     creds  = Credentials.from_service_account_file(GOOGLE_CREDENTIALS_FILE, scopes=SCOPES)
     client = gspread.authorize(creds)
+
+    # ── Main assets sheet ──
     try:
         spreadsheet = client.open(SPREADSHEET_NAME)
     except gspread.SpreadsheetNotFound:
@@ -61,22 +109,133 @@ def connect_sheets():
             "Create it in Google Sheets and share it with your service account email."
         )
         sys.exit(1)
+
     try:
         worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
     except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=WORKSHEET_NAME, rows=2000, cols=10)
+        worksheet = spreadsheet.add_worksheet(title=WORKSHEET_NAME, rows=2000, cols=20)
         log.info(f"Created new worksheet '{WORKSHEET_NAME}'.")
-    return worksheet
+
+    # ── Subreddits sheet (by spreadsheet ID) ──
+    sub_worksheet = None
+    try:
+        sub_spreadsheet = client.open_by_key(SUBREDDITS_SPREADSHEET_ID)
+        try:
+            sub_worksheet = sub_spreadsheet.worksheet(SUBREDDITS_WORKSHEET_NAME)
+        except gspread.WorksheetNotFound:
+            sub_worksheet = sub_spreadsheet.add_worksheet(
+                title=SUBREDDITS_WORKSHEET_NAME, rows=1000, cols=3
+            )
+            log.info("Created subreddits worksheet.")
+    except Exception as e:
+        log.warning(f"Could not connect to subreddits spreadsheet: {e}. Subreddit tracking disabled.")
+
+    return worksheet, sub_worksheet
 
 
 def ensure_header(worksheet):
-    """Write header if sheet is empty. Returns list of existing URLs."""
+    """
+    Write header and freeze row 1 on first run.
+    Updates header silently if new columns were added.
+    Returns (existing_urls, existing_rows).
+    """
     rows = worksheet.get_all_values()
+
     if not rows:
         worksheet.append_row(HEADER, value_input_option="RAW")
-        log.info("Header row written.")
-        return []
-    return [row[0] for row in rows[1:] if row and row[0]]
+        worksheet.freeze(rows=1)
+        log.info("Header row written and frozen.")
+        return [], []
+
+    if rows[0] != HEADER:
+        worksheet.update("A1", [HEADER])
+        worksheet.freeze(rows=1)
+        log.info("Header row updated and frozen.")
+
+    existing_rows = rows[1:]
+    existing_urls = [row[COL_URL] for row in existing_rows if row and row[COL_URL]]
+    return existing_urls, existing_rows
+
+
+def get_existing_subreddits(sub_worksheet):
+    """Return lowercase set of subreddits already tracked."""
+    if sub_worksheet is None:
+        return set()
+    values = sub_worksheet.get_all_values()
+    # Skip header row if present
+    data = values[1:] if values and values[0] and values[0][0].lower() == "subreddit" else values
+    return {row[0].strip().lower() for row in data if row and row[0].strip()}
+
+
+def update_subreddits(sub_worksheet, existing_subreddits, new_subreddits):
+    """Append any subreddits not already in the tracking sheet."""
+    if sub_worksheet is None:
+        return
+
+    # Write header if sheet is empty
+    current = sub_worksheet.get_all_values()
+    if not current:
+        sub_worksheet.append_row(["Subreddit", "First Seen"], value_input_option="RAW")
+        sub_worksheet.freeze(rows=1)
+
+    to_add = sorted(s for s in new_subreddits if s and s.lower() not in existing_subreddits)
+    if to_add:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        sub_worksheet.append_rows([[s, today] for s in to_add], value_input_option="RAW")
+        log.info(f"Tracked {len(to_add)} new subreddit(s): {', '.join(to_add)}")
+
+# ─── IMAGE HASHING ────────────────────────────────────────────────────────────
+
+def fetch_image_hash(thumbnail_url):
+    """Download thumbnail and return perceptual hash string, or '' on failure."""
+    if not IMAGE_HASH_AVAILABLE or not thumbnail_url:
+        return ""
+    try:
+        resp = requests.get(
+            thumbnail_url,
+            timeout=10,
+            headers={"User-Agent": "reddit-saved-rss-reader/1.0"},
+        )
+        resp.raise_for_status()
+        img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        return str(imagehash.phash(img))
+    except Exception as e:
+        log.debug(f"Image hash failed for {thumbnail_url}: {e}")
+        return ""
+
+# ─── REPOST DETECTION ─────────────────────────────────────────────────────────
+
+def find_repost(title, img_hash, existing_rows):
+    """
+    Check title similarity and image hash against all existing rows.
+    Returns the URL of the suspected original post, or '' if no match.
+    A match requires EITHER a close-enough title OR a close-enough image hash.
+    """
+    for row in existing_rows:
+        if len(row) < 2:
+            continue
+
+        existing_url   = row[COL_URL]   if len(row) > COL_URL   else ""
+        existing_title = row[COL_TITLE] if len(row) > COL_TITLE else ""
+        existing_hash  = row[COL_HASH]  if len(row) > COL_HASH  else ""
+
+        # ── Title similarity ──
+        if FUZZY_AVAILABLE and title and existing_title:
+            score = fuzz.token_sort_ratio(title.lower(), existing_title.lower())
+            if score >= TITLE_SIMILARITY_THRESHOLD:
+                return existing_url
+
+        # ── Image hash similarity ──
+        if IMAGE_HASH_AVAILABLE and img_hash and existing_hash:
+            try:
+                h1 = imagehash.hex_to_hash(img_hash)
+                h2 = imagehash.hex_to_hash(existing_hash)
+                if (h1 - h2) <= IMAGE_HASH_THRESHOLD:
+                    return existing_url
+            except Exception:
+                pass
+
+    return ""
 
 # ─── RSS PARSING ──────────────────────────────────────────────────────────────
 
@@ -89,19 +248,17 @@ def fetch_rss(url):
         log.error(f"Failed to fetch RSS feed: {e}")
         sys.exit(1)
 
-    root = ET.fromstring(resp.content)
+    root    = ET.fromstring(resp.content)
     entries = root.findall("atom:entry", NS)
     log.info(f"RSS feed returned {len(entries)} entries.")
 
     items = []
     for entry in entries:
-        # URL — prefer the <link rel="alternate"> href
+        # ── URL ──
         link_el = entry.find("atom:link[@rel='alternate']", NS)
         if link_el is None:
             link_el = entry.find("atom:link", NS)
         url_val = link_el.attrib.get("href", "").strip() if link_el is not None else ""
-
-        # Normalise to new.reddit.com links
         url_val = url_val.replace("old.reddit.com", "www.reddit.com")
 
         if not url_val or "reddit.com" not in url_val:
@@ -109,31 +266,58 @@ def fetch_rss(url):
 
         title = (entry.findtext("atom:title", default="", namespaces=NS) or "").strip()
 
-        # Subreddit from <category> label attribute
-        cat = entry.find("atom:category", NS)
+        # ── Subreddit ──
+        cat       = entry.find("atom:category", NS)
         subreddit = ""
         if cat is not None:
-            label = cat.attrib.get("label", "")          # e.g. "r/marketing"
+            label     = cat.attrib.get("label", "")
             subreddit = label.lstrip("r/") if label else cat.attrib.get("term", "")
 
-        # Post vs Comment — comments have /comments/.../comment_id/ in URL
-        kind = "Comment" if "/comment/" in url_val else "Post"
-
+        kind         = "Comment" if "/comment/" in url_val else "Post"
         date_fetched = datetime.utcnow().strftime("%Y-%m-%d")
 
-        items.append((url_val, title, subreddit, kind, date_fetched))
+        # ── Thumbnail URL (for image hashing) ──
+        thumbnail_url = ""
+
+        # Try <media:thumbnail url="...">
+        thumb_el = entry.find("media:thumbnail", NS)
+        if thumb_el is not None:
+            thumbnail_url = thumb_el.attrib.get("url", "")
+
+        # Fallback: parse <img src="..."> from entry content
+        if not thumbnail_url:
+            content_el = entry.find("atom:content", NS)
+            if content_el is not None:
+                content_text = content_el.text or ""
+                img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', content_text)
+                if img_match:
+                    thumbnail_url = img_match.group(1)
+
+        items.append((url_val, title, subreddit, kind, date_fetched, thumbnail_url))
 
     return items
 
 # ─── DEDUP + APPEND ───────────────────────────────────────────────────────────
 
-def append_new(worksheet, existing_urls, items):
+def append_new(worksheet, existing_urls, existing_rows, items):
     existing_set = set(existing_urls)
-    new_rows = []
-    for url, title, subreddit, kind, date_fetched in items:
-        if url not in existing_set:
-            new_rows.append([url, title, subreddit, kind, date_fetched, "Pending", ""])
-            existing_set.add(url)
+    all_rows     = list(existing_rows)   # grows as we add rows this run
+    new_rows     = []
+
+    for url_val, title, subreddit, kind, date_fetched, thumbnail_url in items:
+        if url_val in existing_set:
+            continue
+
+        img_hash  = fetch_image_hash(thumbnail_url)
+        repost_of = find_repost(title, img_hash, all_rows)
+
+        if repost_of:
+            log.info(f"Potential repost: '{title[:60]}' → {repost_of}")
+
+        row = [url_val, title, subreddit, kind, date_fetched, "Pending", "", img_hash, repost_of]
+        new_rows.append(row)
+        existing_set.add(url_val)
+        all_rows.append(row)
 
     if not new_rows:
         log.info("No new items — sheet is already up to date.")
@@ -147,14 +331,26 @@ def append_new(worksheet, existing_urls, items):
 
 def main():
     log.info("=== Reddit RSS Scraper starting ===")
-    worksheet     = connect_sheets()
-    existing_urls = ensure_header(worksheet)
+
+    if not FUZZY_AVAILABLE:
+        log.warning("thefuzz not installed — title similarity detection disabled.")
+    if not IMAGE_HASH_AVAILABLE:
+        log.warning("Pillow/imagehash not installed — image hash detection disabled.")
+
+    worksheet, sub_worksheet       = connect_sheets()
+    existing_urls, existing_rows   = ensure_header(worksheet)
     log.info(f"Sheet currently has {len(existing_urls)} entries.")
 
     items = fetch_rss(RSS_URL)
-    added = append_new(worksheet, existing_urls, items)
 
+    # ── Subreddit tracking ──
+    existing_subs = get_existing_subreddits(sub_worksheet)
+    new_subs      = {item[2] for item in items if item[2]}
+    update_subreddits(sub_worksheet, existing_subs, new_subs)
+
+    added = append_new(worksheet, existing_urls, existing_rows, items)
     log.info(f"=== Done. {added} new item(s) added. ===")
+
 
 if __name__ == "__main__":
     main()
