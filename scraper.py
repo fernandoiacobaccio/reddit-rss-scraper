@@ -8,14 +8,12 @@ Features:
   - Deduplication by URL
   - Media detection: Image / GIF / Video / Redgif / Gallery / Text / Link / Comment
   - Repost detection: title fuzzy match + perceptual image hash
-  - Unique subreddit tracking in a separate spreadsheet
   - Header row with freeze on first run
 
 Run manually or schedule with Task Scheduler (Windows) / cron (Mac).
 """
 
 import io
-import re
 import sys
 import time
 import logging
@@ -43,12 +41,10 @@ except ImportError:
 
 RSS_URL = "https://www.reddit.com/user/DirectionEuphoric275/saved.rss?feed=7d202c884b326cb4ef634954444288b694b6b0bd&user=DirectionEuphoric275"
 
-SPREADSHEET_NAME          = "Reddit Saved Assets"   # main sheet name
-WORKSHEET_NAME            = "Assets"                # tab inside main sheet
-SUBREDDITS_SPREADSHEET_ID = "1NhwHFOeW18xRU2KD5tWkpr1kSJ0x1SssHRU9hgmhsD8"
-SUBREDDITS_WORKSHEET_NAME = "Sheet1"                # tab inside subreddits sheet
+SPREADSHEET_NAME        = "Reddit Saved Assets"   # main sheet name
+WORKSHEET_NAME          = "Assets"                # tab inside main sheet
 
-GOOGLE_CREDENTIALS_FILE   = "google_credentials.json"
+GOOGLE_CREDENTIALS_FILE = "google_credentials.json"
 
 TITLE_SIMILARITY_THRESHOLD = 85   # 0–100; scores above this flag a potential repost
 IMAGE_HASH_THRESHOLD       = 10   # hamming distance; values below this flag a potential repost
@@ -106,11 +102,10 @@ REDDIT_HEADERS = {"User-Agent": "reddit-saved-rss-reader/1.0"}
 # ─── GOOGLE SHEETS ────────────────────────────────────────────────────────────
 
 def connect_sheets():
-    """Connect to both spreadsheets. Returns (assets_worksheet, subreddits_worksheet)."""
+    """Connect to the assets spreadsheet. Returns the assets worksheet."""
     creds  = Credentials.from_service_account_file(GOOGLE_CREDENTIALS_FILE, scopes=SCOPES)
     client = gspread.authorize(creds)
 
-    # ── Main assets sheet ──
     try:
         spreadsheet = client.open(SPREADSHEET_NAME)
     except gspread.SpreadsheetNotFound:
@@ -126,21 +121,7 @@ def connect_sheets():
         worksheet = spreadsheet.add_worksheet(title=WORKSHEET_NAME, rows=2000, cols=20)
         log.info(f"Created new worksheet '{WORKSHEET_NAME}'.")
 
-    # ── Subreddits sheet (by spreadsheet ID) ──
-    sub_worksheet = None
-    try:
-        sub_spreadsheet = client.open_by_key(SUBREDDITS_SPREADSHEET_ID)
-        try:
-            sub_worksheet = sub_spreadsheet.worksheet(SUBREDDITS_WORKSHEET_NAME)
-        except gspread.WorksheetNotFound:
-            sub_worksheet = sub_spreadsheet.add_worksheet(
-                title=SUBREDDITS_WORKSHEET_NAME, rows=1000, cols=3
-            )
-            log.info("Created subreddits worksheet.")
-    except Exception as e:
-        log.warning(f"Could not connect to subreddits spreadsheet: {e}. Subreddit tracking disabled.")
-
-    return worksheet, sub_worksheet
+    return worksheet
 
 
 def ensure_header(worksheet):
@@ -166,31 +147,6 @@ def ensure_header(worksheet):
     existing_urls = [row[COL_URL] for row in existing_rows if row and row[COL_URL]]
     return existing_urls, existing_rows
 
-
-def get_existing_subreddits(sub_worksheet):
-    """Return lowercase set of subreddits already tracked."""
-    if sub_worksheet is None:
-        return set()
-    values = sub_worksheet.get_all_values()
-    data = values[1:] if values and values[0] and values[0][0].lower() == "subreddit" else values
-    return {row[0].strip().lower() for row in data if row and row[0].strip()}
-
-
-def update_subreddits(sub_worksheet, existing_subreddits, new_subreddits):
-    """Append any subreddits not already in the tracking sheet."""
-    if sub_worksheet is None:
-        return
-
-    current = sub_worksheet.get_all_values()
-    if not current:
-        sub_worksheet.append_row(["Subreddit", "First Seen"], value_input_option="RAW")
-        sub_worksheet.freeze(rows=1)
-
-    to_add = sorted(s for s in new_subreddits if s and s.lower() not in existing_subreddits)
-    if to_add:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        sub_worksheet.append_rows([[s, today] for s in to_add], value_input_option="RAW")
-        log.info(f"Tracked {len(to_add)} new subreddit(s): {', '.join(to_add)}")
 
 # ─── MEDIA DETECTION ──────────────────────────────────────────────────────────
 
@@ -420,16 +376,11 @@ def main():
     if not IMAGE_HASH_AVAILABLE:
         log.warning("Pillow/imagehash not installed — image hash detection disabled.")
 
-    worksheet, sub_worksheet     = connect_sheets()
+    worksheet                    = connect_sheets()
     existing_urls, existing_rows = ensure_header(worksheet)
     log.info(f"Sheet currently has {len(existing_urls)} entries.")
 
     items = fetch_rss(RSS_URL)
-
-    existing_subs = get_existing_subreddits(sub_worksheet)
-    new_subs      = {item[2] for item in items if item[2]}
-    update_subreddits(sub_worksheet, existing_subs, new_subs)
-
     added = append_new(worksheet, existing_urls, existing_rows, items)
     log.info(f"=== Done. {added} new item(s) added. ===")
 
